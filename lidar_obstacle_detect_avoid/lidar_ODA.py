@@ -36,25 +36,28 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
 import open3d as o3d
+from std_msgs.msg import Float64MultiArray
 from geometry_msgs.msg import Twist, PoseStamped, TwistStamped
 from chrono_ros_interfaces.msg import DriverInputs as VehicleInput
 from chrono_ros_interfaces.msg import Body
 from nav_msgs.msg import Path
 from ament_index_python.packages import get_package_share_directory
 import numpy as np
+import random
 import os
 import torch
 import torch.nn as nn
-os.environ["KERAS_BACKEND"] = "torch"
 import csv 
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.qos import QoSHistoryPolicy
 from rclpy.qos import QoSProfile
-from keras_core.models import load_model
 import sys
 from sklearn.cluster import DBSCAN
+from sklearn.linear_model import RANSACRegressor
 ament_tools_root = os.path.join(os.path.dirname(__file__), '.')
 sys.path.insert(0, os.path.abspath(ament_tools_root))
-
+from ConditionalAvoidanceNN import NeuralNetwork
+from ConditionalAvoidanceClassifier import load_classifier, predict_labels
 
 class ControlNode(Node):
     def __init__(self):
@@ -62,13 +65,23 @@ class ControlNode(Node):
 
         # update frequency of this node
         self.freq = 10.0
-
+        # declare parameters:
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('exp_index', 1, ParameterDescriptor(description='experiments index'))
+            ]
+        )
+        self.exp_index = self.get_parameter('exp_index').get_parameter_value().integer_value
         # READ IN SHARE DIRECTORY LOCATION
         package_share_directory = get_package_share_directory('lidar_obstacle_detect_avoid')
         # initialize control inputs
         self.steering = 0.0
-        self.throttle = 0.7
+        self.throttle = random.uniform(0.3, 1)
         self.braking = 0.0
+        # vehicle power
+        self.engine_speed = 0.0
+        self.engine_tq = 0.0
 
         # initialize vehicle state
         self.x = 0.0
@@ -82,7 +95,7 @@ class ControlNode(Node):
         self.go = False
         self.vehicle_cmd = VehicleInput()
         self.pc_data = []
-        self.file = open("/sbel/Desktop/waypoints_paths/path_data_1.csv")
+        self.file = open("/sbel/Desktop/waypoints_paths/straight_line_x.csv")
         self.ref_traj = np.loadtxt(self.file,delimiter=",")
         self.lookahead = 1.0
         self.counter = 1
@@ -98,8 +111,15 @@ class ControlNode(Node):
         self.sub_state = self.create_subscription(TwistStamped, '/m113/state/twist', self.vel_callback, qos_profile)
         self.pub_vehicle_cmd = self.create_publisher(VehicleInput, '/m113/driver_inputs', 4)
         self.sub_PCdata = self.create_subscription(PointCloud2,'/m113/pointcloud',self.lidar_callback,qos_profile)
+        self.sub_Enginedata = self.create_subscription(Float64MultiArray,'/m113/engine_power',self.engine_callback,qos_profile)
         self.timer = self.create_timer(1/self.freq, self.pub_callback)
-
+        self.bounding_box = []
+        self.safety_coef = 0.01
+        self.avoid_model = NeuralNetwork()
+        self.avoid_model.load_state_dict(torch.load("/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/conditional_avoid_model_scm.pth"))
+        self.avoid_model.eval()
+        self.avoid_classifier, self.avoid_scaler = load_classifier('/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/classifier_model.pkl')
+        
     def state_callback(self, msg):
         # self.get_logger().info("Received '%s'" % msg)
         self.state = msg
@@ -112,6 +132,10 @@ class ControlNode(Node):
         e3 = msg.pose.orientation.w
         self.theta = np.arctan2(2*(e0*e3+e1*e2),e0**2+e1**2-e2**2-e3**2)
     
+    def engine_callback(self, msg):
+        self.engine_speed = msg.data[0]
+        self.engine_tq = msg.data[1]
+    
     def vel_callback(self, msg):
         self.v = np.sqrt(msg.twist.linear.x ** 2 + msg.twist.linear.y ** 2)
         
@@ -123,52 +147,90 @@ class ControlNode(Node):
         self.avoid_right = np.mean(big_rocks_samples[:,1])< 0 
         self.bigrock_direction = np.arctan2(np.mean(big_rocks_samples[:,1]),np.mean(big_rocks_samples[:,0]))
         self.steering_mag = 0.3*( np.exp(- ( abs(self.bigrock_direction) - 1.4 ) ) - 1 )
-        
+    
+    def make_inference(self, model, new_features):
+        # Convert new features to torch tensor
+        new_features_tensor = torch.tensor(new_features, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
+        with torch.no_grad():  # No need to track gradients for inference
+            output = model(new_features_tensor)
+            predicted_prob = torch.sigmoid(output).item()
+        return predicted_prob
+    
     def Obstacle_Detection_ptClustering(self,eps=0.2, min_samples=10):
         points = self.pc_np
         # filter out the "ground" floor points
-        min_z = min(points[:, 2])
-        points = points[points[:, 2] > min_z + 0.2]
+        # Prepare the features (x, y) and target (z)
+        X = points[:, :2]  # x and y coordinates
+        y = points[:, 2]   # z coordinate
+        # Fit a plane using RANSAC
+        ransac = RANSACRegressor()
+        ransac.fit(X, y)
+        # Identify inliers (ground) and outliers (non-ground)
+        inlier_mask = ransac.inlier_mask_
+        outlier_mask = np.logical_not(inlier_mask)
+        # Separate ground and non-ground points
+        ground_points = points[inlier_mask]
+        non_ground_points = points[outlier_mask]
+        
+        #customize min_samples based on the number of points
+        min_samples = int (non_ground_points.shape[0] / 2 ) + 1
         # Cluster the data
-        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(points)
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(non_ground_points)
         labels = clustering.labels_
         unique_labels = set(labels)
+        self.get_logger().info("unique: %s" % unique_labels)
         cluster_centers = []
+        cluster_dim_array = []
         #print(unique_labels)
+        self.bounding_box = np.zeros(3)
         for k in unique_labels:
             if k == -1:  # Skip noise points
                 continue
             # Extract points belonging to the current cluster
             class_member_mask = (labels == k)
-            cluster_points = points[class_member_mask]
+            cluster_points = non_ground_points[class_member_mask]
             
             # Check if cluster fits within the bounding box dimensions
             min_pt = np.min(cluster_points, axis=0)
             max_pt = np.max(cluster_points, axis=0)
             # compute bounding box dimension
             cluster_dim = max_pt - min_pt
-            # filter out small clusters
-            if cluster_dim[2]>0.2:
-                
-                center = cluster_points.mean(axis=0)
-                cluster_centers.append(center)
+            self.bounding_box = cluster_dim
+            cluster_dim_array.append(cluster_dim)
+            center = cluster_points.mean(axis=0)
+            cluster_centers.append(center)
+            
+        # self.get_logger().info("bounding box: %s" % self.bounding_box)
         # obtain the closest point
-        self.get_logger().info("candidate obstacle position: %s" % cluster_centers)
-        if  cluster_centers == []:
+        #self.get_logger().info("candidate obstacle position: %s" % cluster_centers)
+        if  cluster_centers == [] or len(unique_labels)==1:
+            self.get_logger().info("We good, don't see anything")
             self.aviodance_state = False
         else:
             # get the closest detected obstacle
             cluster_centers = np.array(cluster_centers)
             ind_closest = np.argmin( np.sum(cluster_centers[:, :2] ** 2, axis=1) )
             obs_center = cluster_centers[ind_closest]
+            obs_dim = cluster_dim_array[ind_closest]
             
-            if obs_center[0] < 4 and abs(obs_center[0]) > 0.35 and abs(obs_center[1]) < 2.5:
-                self.get_logger().info("closest obstacle: %s" % obs_center)
-                self.aviodance_state = True
-                self.avoid_right = obs_center[1] < 0
-                obs_direction = np.arctan2(obs_center[1],obs_center[0])
-                self.steering_mag = 0.3*( np.exp(- ( abs(obs_direction) - 1.4 ) ) - 1 )
+            input_NN = [self.v, obs_dim[0], obs_dim[1], obs_dim[2],self.engine_tq*self.engine_speed]
+            pre_vals = self.make_inference(self.avoid_model, input_NN)
+            # input_classifier = np.array([self.v,obs_dim[0], obs_dim[1], obs_dim[2],self.engine_tq*self.engine_speed]).reshape(1, -1)
+            # safe_to_cross = predict_labels(self.avoid_classifier, self.avoid_scaler,input_classifier)
+            
+            if pre_vals < 0.61 - 0.05:
+            #if not safe_to_cross:
+                self.get_logger().info("Identifier: Danger!!!")
+                if obs_center[0] < 4 and abs(obs_center[1]) < 2.5:
+                    self.get_logger().info("closest obstacle: %s" % obs_center)
+                    self.aviodance_state = True
+                    self.avoid_right = obs_center[1] < 0
+                    obs_direction = np.arctan2(obs_center[1],obs_center[0])
+                    self.steering_mag = 0.3*( np.exp(- ( abs(obs_direction) - 1.4 ) ) - 1 )
+                else:
+                    self.aviodance_state = False
             else:
+                self.get_logger().info("Identifier: pretty safe to cross")
                 self.aviodance_state = False
             
         
@@ -254,12 +316,11 @@ class ControlNode(Node):
         e = self.error_state()
         
         #self.throttle = ctrl[0,0].item()
-        self.throttle = 0.7
         
         ########### choose obstacle detection method:
         # self.Obstacle_Detection_ptCounting()
         self.Obstacle_Detection_ptClustering()
-        # obstacle avoidance based on detection
+        # # obstacle avoidance based on detection
         if self.aviodance_state:
             self.get_logger().info('avoiding !!!')
             if self.avoid_right:
@@ -271,15 +332,17 @@ class ControlNode(Node):
             
         else:
             steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.72672704 , 0.78409284 ,-0.0105355 ])])
-            self.get_logger().info('safe')
-        
-        # ensure steering can't change too much between timesteps, smooth transition
+            # self.get_logger().info('safe')
+        #steering = 0.0
+        ##### ensure steering can't change too much between timesteps, smooth transition
         delta_steering = steering - self.steering
-        if abs(delta_steering) > 0.25:
-            self.steering = self.steering + 0.25 * delta_steering / abs(delta_steering)
+        if abs(delta_steering) > 0.2:
+            self.steering = self.steering + 0.2 * delta_steering / abs(delta_steering)
             self.get_logger().info("!!!!!!!!!!!!!!!!!!steering changed too much, smoothing!!!!!!!!!!!!!!!!!!")
         else:
             self.steering = steering
+        
+        
         
         ### for vehicle one
         msg = VehicleInput()
@@ -293,17 +356,18 @@ class ControlNode(Node):
         
         # # ## record data
         # # Save the point cloud to a PCD file
-        # pc_file_path = './training_data_rinf_3/pc/'+str(self.counter) + '.csv'
-        # np.savetxt(pc_file_path, self.pc_data, delimiter=',',fmt='%.8f')
+        # # pc_file_path = './pc/'+str(self.counter) + '.csv'
+        ## np.savetxt(pc_file_path, self.pc_data, delimiter=',',fmt='%.8f')
         # ##self.get_logger().info("done saving data")
-        # estate_ctr_input_file_path = './training_data_rinf_3/e_state_ctrl/estate_ctrl_'+str(self.counter) + '.csv'
-        # with open (estate_ctr_input_file_path,'a', encoding='UTF8') as csvfile:
+        # log_file_path = './trainingData/input_'+str(self.exp_index) + '.csv'
+        # data_output = 'traj_output_.csv'
+        # with open (log_file_path,'a', encoding='UTF8') as csvfile:
         #         my_writer = csv.writer(csvfile, quoting=csv.QUOTE_NONE, escapechar=' ')
         #         #for row in pt:
-        #         my_writer.writerow([e[0],e[1],e[2],e[3],msg.throttle,msg.steering])
+        #         my_writer.writerow([self.x, self.y, self.v,msg.throttle, self.bounding_box[0], self.bounding_box[1],self.bounding_box[2],self.engine_speed,self.engine_tq])
         #         csvfile.close()
 
-        # self.counter += 1
+        self.counter += 1
 
 def main(args=None):
     rclpy.init(args=args)
