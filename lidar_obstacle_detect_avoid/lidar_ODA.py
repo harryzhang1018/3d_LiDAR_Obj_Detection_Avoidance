@@ -77,7 +77,7 @@ class ControlNode(Node):
         package_share_directory = get_package_share_directory('lidar_obstacle_detect_avoid')
         # initialize control inputs
         self.steering = 0.0
-        self.throttle = random.uniform(0.3, 1)
+        self.throttle = 0.8
         self.braking = 0.0
         # vehicle power
         self.engine_speed = 0.0
@@ -95,7 +95,7 @@ class ControlNode(Node):
         self.go = False
         self.vehicle_cmd = VehicleInput()
         self.pc_data = []
-        self.file = open("/sbel/Desktop/waypoints_paths/straight_line_x.csv")
+        self.file = open("/sbel/Desktop/waypoints_paths/path_data_1.csv")
         self.ref_traj = np.loadtxt(self.file,delimiter=",")
         self.lookahead = 1.0
         self.counter = 1
@@ -218,7 +218,7 @@ class ControlNode(Node):
             # input_classifier = np.array([self.v,obs_dim[0], obs_dim[1], obs_dim[2],self.engine_tq*self.engine_speed]).reshape(1, -1)
             # safe_to_cross = predict_labels(self.avoid_classifier, self.avoid_scaler,input_classifier)
             
-            if pre_vals < 0.61 - 0.05:
+            if pre_vals < 0.61 + 0.05:
             #if not safe_to_cross:
                 self.get_logger().info("Identifier: Danger!!!")
                 if obs_center[0] < 4 and abs(obs_center[1]) < 2.5:
@@ -332,12 +332,14 @@ class ControlNode(Node):
             
         else:
             steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.72672704 , 0.78409284 ,-0.0105355 ])])
+        
+        steering = np.clip(steering,-1.0,1.0)
             # self.get_logger().info('safe')
         #steering = 0.0
         ##### ensure steering can't change too much between timesteps, smooth transition
         delta_steering = steering - self.steering
-        if abs(delta_steering) > 0.2:
-            self.steering = self.steering + 0.2 * delta_steering / abs(delta_steering)
+        if abs(delta_steering) > 0.175:
+            self.steering = self.steering + 0.175 * delta_steering / abs(delta_steering)
             self.get_logger().info("!!!!!!!!!!!!!!!!!!steering changed too much, smoothing!!!!!!!!!!!!!!!!!!")
         else:
             self.steering = steering
