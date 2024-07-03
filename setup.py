@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'lidar_ODA = lidar_obstacle_detect_avoid.lidar_ODA:main'
+            'lidar_ODA = lidar_obstacle_detect_avoid.lidar_ODA:main',
+            'lidar_ODA_train = lidar_obstacle_detect_avoid.LiDAR_ODA_training:main'
         ],
     },
 )
