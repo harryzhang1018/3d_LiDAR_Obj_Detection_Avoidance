@@ -94,7 +94,7 @@ class ControlNode(Node):
         self.go = False
         self.vehicle_cmd = VehicleInput()
         self.pc_data = []
-        self.file = open("/sbel/Desktop/waypoints_paths/path_data_1.csv")
+        self.file = open("/sbel/Desktop/waypoints_paths/straight_line_x.csv")
         self.ref_traj = np.loadtxt(self.file,delimiter=",")
         self.lookahead = 1.0
         self.counter = 1
@@ -272,11 +272,9 @@ class ControlNode(Node):
         if(not self.go):
             return
         ## get error state
-        #e_flw = self.follow_error()
-        #e = self.error_state()
-        
-        #self.throttle = ctrl[0,0].item()
-        
+        e = self.error_state()
+        self.steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.72672704 , 0.78409284 ,-0.0105355 ])])
+        self.get_logger().info('implement ctrl')
         ########### choose obstacle detection method:
         # self.Obstacle_Detection_ptCounting()
         self.Obstacle_Detection_ptClustering()
