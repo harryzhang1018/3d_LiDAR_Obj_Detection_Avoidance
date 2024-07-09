@@ -5,6 +5,7 @@ import torch.optim as optim
 from os import listdir
 from os.path import isfile, join
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 import matplotlib
 print(matplotlib.__version__)
 import matplotlib.pyplot as plt
@@ -17,11 +18,11 @@ def load_and_label_data(folder_path):
     for file in file_paths:
         data = np.loadtxt(join(folder_path, file), delimiter=',')
         # Label assignment based on 'x' column
-        label = np.max(data[:, 0]) > 7.0
+        label = np.max(data[:, 0]) > 10.0
         labels.append(float(label))
 
         # Filter data where x < 5 and dimensions are not all zeros
-        valid_data = data[(data[:, 0] < 5) & (data[:, 4] != 0) & (data[:, 5] != 0) & (data[:, 6] != 0)]
+        valid_data = data[(data[:, 0] < 5) & (data[:, 0] > -1.9) & (data[:, 4] != 0) & (data[:, 5] != 0) & (data[:, 6] != 0)]
         if valid_data.size > 0:
             mean_v = np.mean(valid_data[:, 2])
             mean_dim_x = np.mean(valid_data[:, 4])
@@ -97,8 +98,10 @@ def make_inference(model, new_features):
     return predicted_prob
 
 # Load data
-folder_path = 'conditional_avoid/TrainData_SCM'
+folder_path = 'training_data/M113trainingData'
 features, labels = load_and_label_data(folder_path)
+scaler = StandardScaler()
+features = scaler.fit_transform(features)
 np.savetxt('features.csv', features, delimiter=',')
 np.savetxt('labels.csv', labels, delimiter=',')
 # print(features.shape)
@@ -121,6 +124,7 @@ for i in range(len(features)):
 # use clustering to separate the prediction 
 
 predicted_label = np.array(predicted_label).reshape(-1, 1)
+print(predicted_label)
 kmeans = KMeans(n_clusters=2, random_state=0)
 kmeans.fit(predicted_label)
 centroids = kmeans.cluster_centers_
@@ -132,11 +136,11 @@ print(boundary)
 correct = 0
 for i in range(len(predicted_label)):
     if predicted_label[i] > boundary:
-        predicted_label[i] = 1
+        #predicted_label[i] = 1
         if labels[i] == 1:
             correct += 1
     else:
-        predicted_label[i] = 0
+        #predicted_label[i] = 0
         if labels[i] == 0:
             correct += 1
 
