@@ -118,9 +118,9 @@ class ControlNode(Node):
         self.timer = self.create_timer(1/self.freq, self.pub_callback)
         self.bounding_box = []
         self.safety_coef = 0.01 + 0.61561513 # self defined safety value + threshold from the model training
-        self.avoid_model = NeuralNetwork()
-        self.avoid_model.load_state_dict(torch.load("/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/tracked_veh_cond_avoid.pth"))
-        self.avoid_model.eval()
+        # self.avoid_model = NeuralNetwork()
+        # self.avoid_model.load_state_dict(torch.load("/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/tracked_veh_cond_avoid.pth"))
+        # self.avoid_model.eval()
         self.scaler = joblib.load('/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/scaler.pkl')
         self.avoid_model_sk = joblib.load('/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/mlp_model.pkl')
         # self.get_logger().info('updated')
@@ -348,7 +348,7 @@ class ControlNode(Node):
                     self.get_logger().info('Obstacle on your left, turn right')
                 
             else:
-                steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.32672704 , 0.9 ,-0.0105355 ])])
+                steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.32672704 , 1.3 ,-0.0105355 ])])
                 steering = np.clip(steering,-0.45,0.45)
         else:
             steering = 0.0
