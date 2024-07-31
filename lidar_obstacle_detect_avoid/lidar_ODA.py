@@ -57,7 +57,8 @@ from sklearn.linear_model import RANSACRegressor
 ament_tools_root = os.path.join(os.path.dirname(__file__), '.')
 sys.path.insert(0, os.path.abspath(ament_tools_root))
 from ConditionalAvoidanceNN import NeuralNetwork
-from ConditionalAvoidanceClassifier import load_classifier, predict_labels
+import time
+import joblib
 
 class ControlNode(Node):
     def __init__(self):
@@ -77,11 +78,13 @@ class ControlNode(Node):
         package_share_directory = get_package_share_directory('lidar_obstacle_detect_avoid')
         # initialize control inputs
         self.steering = 0.0
-        self.throttle = 0.8
+        self.throttle = 0.6
         self.braking = 0.0
         # vehicle power
         self.engine_speed = 0.0
         self.engine_tq = 0.0
+        self.engine_speed_list = []
+        self.engine_tq_list = []
 
         # initialize vehicle state
         self.x = 0.0
@@ -95,9 +98,9 @@ class ControlNode(Node):
         self.go = False
         self.vehicle_cmd = VehicleInput()
         self.pc_data = []
-        self.file = open("/sbel/Desktop/waypoints_paths/path_data_1.csv")
+        self.file = open("/sbel/Desktop/waypoints_paths/square.csv")
         self.ref_traj = np.loadtxt(self.file,delimiter=",")
-        self.lookahead = 1.0
+        self.lookahead = 4.0
         self.counter = 1
         self.pc_input = []
         self.e_input = []
@@ -109,16 +112,18 @@ class ControlNode(Node):
         qos_profile.history = QoSHistoryPolicy.KEEP_LAST
         self.sub_state = self.create_subscription(PoseStamped, '/m113/state/pose', self.state_callback, qos_profile)
         self.sub_state = self.create_subscription(TwistStamped, '/m113/state/twist', self.vel_callback, qos_profile)
-        self.pub_vehicle_cmd = self.create_publisher(VehicleInput, '/m113/driver_inputs', 4)
+        self.pub_vehicle_cmd = self.create_publisher(VehicleInput, '/m113/driver_inputs', 5)
         self.sub_PCdata = self.create_subscription(PointCloud2,'/m113/pointcloud',self.lidar_callback,qos_profile)
         self.sub_Enginedata = self.create_subscription(Float64MultiArray,'/m113/engine_power',self.engine_callback,qos_profile)
         self.timer = self.create_timer(1/self.freq, self.pub_callback)
         self.bounding_box = []
-        self.safety_coef = 0.01
+        self.safety_coef = 0.01 + 0.61561513 # self defined safety value + threshold from the model training
         self.avoid_model = NeuralNetwork()
-        self.avoid_model.load_state_dict(torch.load("/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/conditional_avoid_model_scm.pth"))
+        self.avoid_model.load_state_dict(torch.load("/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/tracked_veh_cond_avoid.pth"))
         self.avoid_model.eval()
-        self.avoid_classifier, self.avoid_scaler = load_classifier('/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/classifier_model.pkl')
+        self.scaler = joblib.load('/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/scaler.pkl')
+        self.avoid_model_sk = joblib.load('/sbel/Desktop/ros_ws/src/lidar_obstacle_detect_avoid/lidar_obstacle_detect_avoid/mlp_model.pkl')
+        # self.get_logger().info('updated')
         
     def state_callback(self, msg):
         # self.get_logger().info("Received '%s'" % msg)
@@ -133,20 +138,20 @@ class ControlNode(Node):
         self.theta = np.arctan2(2*(e0*e3+e1*e2),e0**2+e1**2-e2**2-e3**2)
     
     def engine_callback(self, msg):
-        self.engine_speed = msg.data[0]
-        self.engine_tq = msg.data[1]
+        # Append new readings to the lists
+        self.engine_speed_list.append(msg.data[0])
+        self.engine_tq_list.append(msg.data[1])
+        # Keep only the last 20 readings
+        if len(self.engine_speed_list) > 5:
+            self.engine_speed_list.pop(0)
+        if len(self.engine_tq_list) > 5:
+            self.engine_tq_list.pop(0)
+        # Calculate the average
+        self.engine_speed = sum(self.engine_speed_list) / len(self.engine_speed_list)
+        self.engine_tq = sum(self.engine_tq_list) / len(self.engine_tq_list)
     
     def vel_callback(self, msg):
         self.v = np.sqrt(msg.twist.linear.x ** 2 + msg.twist.linear.y ** 2)
-        
-    def Obstacle_Detection_ptCounting(self):
-        downsampled_points = self.pc_np 
-        big_rocks_samples = downsampled_points[downsampled_points[:,2]>-0.8, :]
-        self.aviodance_state = big_rocks_samples.shape[0] >= 50 and abs(np.mean(big_rocks_samples[:,0]))>0.35 and abs(np.mean(big_rocks_samples[:,0]))< 4.0
-        self.get_logger().info("detect suspicious points: %s" % big_rocks_samples.shape[0])
-        self.avoid_right = np.mean(big_rocks_samples[:,1])< 0 
-        self.bigrock_direction = np.arctan2(np.mean(big_rocks_samples[:,1]),np.mean(big_rocks_samples[:,0]))
-        self.steering_mag = 0.3*( np.exp(- ( abs(self.bigrock_direction) - 1.4 ) ) - 1 )
     
     def make_inference(self, model, new_features):
         # Convert new features to torch tensor
@@ -156,7 +161,7 @@ class ControlNode(Node):
             predicted_prob = torch.sigmoid(output).item()
         return predicted_prob
     
-    def Obstacle_Detection_ptClustering(self,eps=0.2, min_samples=10):
+    def Obstacle_Detection_ptClustering(self,eps=0.2, min_samples=20):
         points = self.pc_np
         # filter out the "ground" floor points
         # Prepare the features (x, y) and target (z)
@@ -172,8 +177,6 @@ class ControlNode(Node):
         ground_points = points[inlier_mask]
         non_ground_points = points[outlier_mask]
         
-        #customize min_samples based on the number of points
-        min_samples = int (non_ground_points.shape[0] / 2 ) + 1
         # Cluster the data
         clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(non_ground_points)
         labels = clustering.labels_
@@ -213,20 +216,29 @@ class ControlNode(Node):
             obs_center = cluster_centers[ind_closest]
             obs_dim = cluster_dim_array[ind_closest]
             
-            input_NN = [self.v, obs_dim[0], obs_dim[1], obs_dim[2],self.engine_tq*self.engine_speed]
-            pre_vals = self.make_inference(self.avoid_model, input_NN)
+            self.get_logger().info("closest obstacle: %s" % obs_center)
+            
+            # clip_vel = np.clip(self.v,0.0,1.0)
+            input_NN = np.array([[self.v, obs_dim[0], obs_dim[1], obs_dim[2],self.engine_tq*self.engine_speed]])
+            input_NN = self.scaler.transform(input_NN)
+            
+            ############## could use different trained nn to predict the value##################
+            #pre_vals = self.make_inference(self.avoid_model, input_NN)
+            pre_vals = self.avoid_model_sk.predict_proba(input_NN)[:,1]
+            self.get_logger().info('pre_value:'+str(pre_vals))
             # input_classifier = np.array([self.v,obs_dim[0], obs_dim[1], obs_dim[2],self.engine_tq*self.engine_speed]).reshape(1, -1)
             # safe_to_cross = predict_labels(self.avoid_classifier, self.avoid_scaler,input_classifier)
             
-            if pre_vals < 0.61 + 0.05:
+            if pre_vals < self.safety_coef:
             #if not safe_to_cross:
                 self.get_logger().info("Identifier: Danger!!!")
-                if obs_center[0] < 4 and abs(obs_center[1]) < 2.5:
-                    self.get_logger().info("closest obstacle: %s" % obs_center)
+                
+                if obs_center[0] < 5.0 and abs(obs_center[1]) < 4.0:
+                    
                     self.aviodance_state = True
                     self.avoid_right = obs_center[1] < 0
                     obs_direction = np.arctan2(obs_center[1],obs_center[0])
-                    self.steering_mag = 0.3*( np.exp(- ( abs(obs_direction) - 1.4 ) ) - 1 )
+                    self.steering_mag = 0.7*( np.exp(- ( abs(obs_direction) - 1.4 ) ) - 1 )
                 else:
                     self.aviodance_state = False
             else:
@@ -311,6 +323,8 @@ class ControlNode(Node):
     def pub_callback(self):
         if(not self.go):
             return
+        ### for vehicle one
+        msg = VehicleInput()
         ## get error state
         #e_flw = self.follow_error()
         e = self.error_state()
@@ -318,36 +332,48 @@ class ControlNode(Node):
         #self.throttle = ctrl[0,0].item()
         
         ########### choose obstacle detection method:
-        # self.Obstacle_Detection_ptCounting()
+        time_start = time.time()
         self.Obstacle_Detection_ptClustering()
-        # # obstacle avoidance based on detection
-        if self.aviodance_state:
-            self.get_logger().info('avoiding !!!')
-            if self.avoid_right:
-                steering = 0.3 * self.steering_mag
-                self.get_logger().info('Obstacle on your right, turn left')
+        time_end = time.time()
+        self.get_logger().info("lidar processing time: "+str(time_end-time_start))
+        if self.v > 0.5:
+            # # obstacle avoidance based on detection
+            if self.aviodance_state:
+                self.get_logger().info('avoiding !!!')
+                if self.avoid_right:
+                    steering = 0.45 * self.steering_mag
+                    self.get_logger().info('Obstacle on your right, turn left')
+                else:
+                    steering = -0.45 * self.steering_mag
+                    self.get_logger().info('Obstacle on your left, turn right')
+                
             else:
-                steering = -0.3 * self.steering_mag
-                self.get_logger().info('Obstacle on your left, turn right')
-            
+                steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.32672704 , 0.9 ,-0.0105355 ])])
+                steering = np.clip(steering,-0.45,0.45)
         else:
-            steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.72672704 , 0.78409284 ,-0.0105355 ])])
+            steering = 0.0
+            throttle = 1.0
+            msg.throttle = throttle
+            self.pub_vehicle_cmd.publish(msg)
+            self.get_logger().info('got stuck, getting up to speed')
+            time.sleep(20)
         
-        steering = np.clip(steering,-1.0,1.0)
+        #steering = np.clip(steering,-0.8,0.8)
             # self.get_logger().info('safe')
         #steering = 0.0
         ##### ensure steering can't change too much between timesteps, smooth transition
-        delta_steering = steering - self.steering
-        if abs(delta_steering) > 0.175:
-            self.steering = self.steering + 0.175 * delta_steering / abs(delta_steering)
-            self.get_logger().info("!!!!!!!!!!!!!!!!!!steering changed too much, smoothing!!!!!!!!!!!!!!!!!!")
-        else:
-            self.steering = steering
+        # delta_steering = steering - self.steering
+        # if abs(delta_steering) > 0.175:
+        #     self.steering = self.steering + 0.175 * delta_steering / abs(delta_steering)
+        #     self.get_logger().info("!!!!!!!!!!!!!!!!!!steering changed too much, smoothing!!!!!!!!!!!!!!!!!!")
+        # else:
+        #     self.steering = steering
+        self.steering = steering
+        self.get_logger().info('steering:'+str(self.steering))
         
         
         
-        ### for vehicle one
-        msg = VehicleInput()
+        
         msg.steering = np.clip(self.steering, -1.0, 1.0)
         msg.throttle = np.clip(self.throttle, 0, 1)
         msg.braking = np.clip(self.braking, 0, 1)
